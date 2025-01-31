@@ -1,95 +1,107 @@
-const { Connection, PublicKey } = require('@solana/web3.js');
+require('dotenv').config();
+const axios = require('axios');
 
-// Load the Solana RPC URL from environment variables
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL;
 
-// Verify the RPC URL
-if (!SOLANA_RPC_URL || !SOLANA_RPC_URL.startsWith('http')) {
-    throw new Error('Invalid Solana RPC URL. Please check your .env file.');
+if (!SOLANA_RPC_URL) {
+    throw new Error("SOLANA_RPC_URL is not defined in .env file.");
 }
 
-// Initialize the connection
-const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
-
-/**
- * Fetch the SOL balance of a wallet.
- * @param {string} walletAddress - The wallet address.
- * @returns {number} - The SOL balance.
- */
-async function getSOLBalance(walletAddress) {
-    try {
-        const publicKey = new PublicKey(walletAddress);
-        const balance = await connection.getBalance(publicKey);
-        return balance / 1e9; // Convert lamports to SOL
-    } catch (error) {
-        console.error('Error fetching SOL balance:', error);
-        throw new Error(`Error fetching SOL balance: ${error.message}`);
+// Utility to retry a request up to 3 times with exponential backoff
+const retryRequest = async (requestFunc, retries = 3, delay = 1000) => {
+    let attempts = 0;
+    while (attempts < retries) {
+        try {
+            return await requestFunc();
+        } catch (error) {
+            attempts++;
+            console.warn(`Request failed. Attempt ${attempts} of ${retries}. Retrying...`);
+            if (attempts >= retries) {
+                throw error;
+            }
+            await new Promise(resolve => setTimeout(resolve, delay * attempts));
+        }
     }
-}
+};
 
 /**
- * Fetch and parse token purchases for a wallet.
+ * Fetch transaction signatures with pagination.
  * @param {string} walletAddress - The wallet address.
- * @returns {array} - List of token purchases.
+ * @param {number} limit - How many transactions to fetch.
+ * @returns {Promise<Array>} - List of transaction signatures.
+ */
+const fetchTransactionSignatures = async (walletAddress, limit = 5) => {
+    let signatures = [];
+    let before = null;
+
+    while (signatures.length < limit) {
+        const params = { limit: limit - signatures.length, before };
+        const response = await retryRequest(() =>
+            axios.post(SOLANA_RPC_URL, {
+                jsonrpc: "2.0",
+                id: 1,
+                method: "getConfirmedSignaturesForAddress2",
+                params: [walletAddress, params]
+            })
+        );
+        if (response.data.error) {
+            throw new Error(response.data.error.message);
+        }
+
+        const newSignatures = response.data.result;
+        if (newSignatures.length === 0) break;
+
+        signatures = signatures.concat(newSignatures);
+        before = newSignatures[newSignatures.length - 1].signature;
+    }
+
+    return signatures;
+};
+
+/**
+ * Analyze token purchases with retries.
+ * @param {string} walletAddress - The wallet address.
+ * @returns {Promise<Array>} - List of token purchases.
  */
 async function analyzeTokenPurchases(walletAddress) {
     try {
-        const publicKey = new PublicKey(walletAddress);
-        const transactions = await connection.getSignaturesForAddress(publicKey, { limit: 100 });
-        const tokenPurchases = [];
+        const signatures = await fetchTransactionSignatures(walletAddress, 5);  // Limiting to 5 transactions
+        if (signatures.length === 0) return [];
 
-        for (const tx of transactions) {
-            const parsedTx = await connection.getParsedTransaction(tx.signature);
-            if (parsedTx?.meta?.preTokenBalances) {
-                parsedTx.meta.preTokenBalances.forEach(balance => {
-                    tokenPurchases.push({
-                        token: balance.mint,
-                        amount: balance.uiTokenAmount.uiAmount,
-                        date: new Date(parsedTx.blockTime * 1000).toISOString(),
+        const purchases = [];
+        for (const signature of signatures) {
+            try {
+                const txResponse = await retryRequest(() =>
+                    axios.post(SOLANA_RPC_URL, {
+                        jsonrpc: "2.0",
+                        id: 1,
+                        method: "getTransaction",
+                        params: [signature.signature, { encoding: "jsonParsed" }]
+                    })
+                );
+
+                const transaction = txResponse.data.result;
+                if (!transaction) continue;
+
+                const instructions = transaction.transaction.message.instructions;
+                const tokenTransfers = instructions.filter(instr => instr.program === "spl-token");
+
+                if (tokenTransfers.length > 0) {
+                    purchases.push({
+                        signature: signature.signature,
+                        date: new Date(transaction.blockTime * 1000).toISOString()
                     });
-                });
+                }
+            } catch (error) {
+                console.warn(`Skipping failed transaction fetch: ${signature.signature}`);
             }
         }
 
-        return tokenPurchases;
+        return purchases;
     } catch (error) {
-        console.error('Error analyzing token purchases:', error);
-        throw new Error(`Error analyzing token purchases: ${error.message}`);
+        console.error('Error analyzing token purchases:', error.message || error);
+        throw new Error(`Error analyzing token purchases: ${error.message || error}`);
     }
 }
 
-/**
- * Analyze frequent transfers (SOL/USDC) for a wallet.
- * @param {string} walletAddress - The wallet address.
- * @returns {array} - List of wallets that received SOL/USDC more than 3 times.
- */
-async function analyzeFrequentTransfers(walletAddress) {
-    try {
-        const publicKey = new PublicKey(walletAddress);
-        const transactions = await connection.getSignaturesForAddress(publicKey, { limit: 100 });
-        const transferCounts = {};
-
-        for (const tx of transactions) {
-            const parsedTx = await connection.getParsedTransaction(tx.signature);
-            if (parsedTx?.transaction?.message?.instructions) {
-                parsedTx.transaction.message.instructions.forEach(instruction => {
-                    if (instruction.program === 'spl-token' && instruction.parsed?.info?.destination) {
-                        const destination = instruction.parsed.info.destination;
-                        transferCounts[destination] = (transferCounts[destination] || 0) + 1;
-                    }
-                });
-            }
-        }
-
-        const frequentTransfers = Object.entries(transferCounts)
-            .filter(([_, count]) => count > 3)
-            .map(([wallet, _]) => wallet);
-
-        return frequentTransfers;
-    } catch (error) {
-        console.error('Error analyzing frequent transfers:', error);
-        throw new Error(`Error analyzing frequent transfers: ${error.message}`);
-    }
-}
-
-module.exports = { getSOLBalance, analyzeTokenPurchases, analyzeFrequentTransfers };
+module.exports = { fetchTransactionSignatures, analyzeTokenPurchases };
